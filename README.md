@@ -52,8 +52,3 @@ This mod is in **active development**. Some features are experimental and may ch
 Your feedback shapes the future of this mod!  
 Feel free to [open an issue](https://github.com/Omar4767Ahmed/EasyDeals/issues) or contribute via a pull request.
 
----
-
-## 🔗 GitHub Repository
-
-🔗 [Schedule 1 Deal Manager - GitHub](https://github.com/Omar4767Ahmed/EasyDeals)
