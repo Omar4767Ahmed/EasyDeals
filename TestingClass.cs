@@ -43,16 +43,13 @@ namespace TestingClass
                     continue;
                 }
 
-                // Get orderable products for the current customer
                 Il2CppSystem.Collections.Generic.List<ProductDefinition> products = currentUnlockedCustomer.OrderableProducts;
 
-                // Cache the first product if no product has been cached yet
                 if (cachedProduct == null && products.Count > 0)
                 {
                     cachedProduct = products[0]; // Cache the first available product
                 }
 
-                // If the customer doesn't have orderable products, use the cached product
                 ProductDefinition randomProduct = null;
 
                 if (products.Count > 0)
@@ -66,7 +63,6 @@ namespace TestingClass
 
                 if (randomProduct == null)
                 {
-                    // Skip if no valid product could be selected
                     UnlockedCustomers.RemoveAt(randomNumber);
                     continue;
                 }
@@ -103,13 +99,10 @@ namespace TestingClass
                     false
                 );
 
-                // Offer the contract (assuming OfferContract is implemented in your API)
                 currentUnlockedCustomer.OfferContract(_contractInfo);
 
-                // Remove the customer from the list after processing
                 UnlockedCustomers.RemoveAt(randomNumber);
 
-                // Decrease the number of quests
                 numberOfQuests--;
             }
         }
