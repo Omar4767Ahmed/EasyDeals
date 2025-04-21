@@ -20,7 +20,7 @@ using Il2CppScheduleOne.Properties;
 using Il2CppFishNet.Connection;
 using HarmonyLib;
 using Il2CppScheduleOne.UI.Phone.Messages;
-
+using TestingClass;
 namespace easy_deals
 {
     public static class KeyBindings
@@ -37,22 +37,32 @@ namespace easy_deals
     }
     public class ContractManager
     {
+        private static readonly object _lock = new object();
         private static ContractManager _instance;
-        public static ContractManager Instance => _instance ?? (_instance = new ContractManager());
+        public static ContractManager Instance
+        {
+            get
+            {
+                lock (_lock)
+                {
+                    return _instance ?? (_instance = new ContractManager());
+                }
+            }
+        }
 
         private readonly List<PendingContract> _pendingContracts = new List<PendingContract>();
+        private readonly Queue<PendingContract> _contractPool = new Queue<PendingContract>();
         private bool _isProcessing = false;
         public float OverallPriceModifier { get; set; } = 10f;
         private readonly Dictionary<string, float> _potentialGains = new Dictionary<string, float>();
         private readonly Dictionary<string, int> _totalQuantities = new Dictionary<string, int>();
-        private List<string> _offeredProducts = new List<string> { "All" };
+        private readonly List<string> _offeredProducts = new List<string> { "All" };
         private bool _productsChanged = false;
 
         private ContractManager()
         {
             _potentialGains["All"] = 0f;
             _totalQuantities["All"] = 0;
-            UpdateCache();
             MelonLogger.Msg("ContractManager initialized with default 'All' values");
         }
 
@@ -64,10 +74,28 @@ namespace easy_deals
                 return;
             }
 
-            var contract = new PendingContract(product, quantity, payment, customer);
+            var contract = GetContract(product, quantity, payment, customer);
             _pendingContracts.Add(contract);
+
+            _potentialGains.TryGetValue("All", out float allGains);
+            _potentialGains["All"] = allGains + payment + OverallPriceModifier;
+
+            _totalQuantities.TryGetValue("All", out int allQuantities);
+            _totalQuantities["All"] = allQuantities + quantity;
+
+            _potentialGains.TryGetValue(product.Name, out float productGains);
+            _potentialGains[product.Name] = productGains + payment + OverallPriceModifier;
+
+            _totalQuantities.TryGetValue(product.Name, out int productQuantities);
+            _totalQuantities[product.Name] = productQuantities + quantity;
+
+            if (!_offeredProducts.Contains(product.Name))
+            {
+                _offeredProducts.Add(product.Name);
+                _offeredProducts.Sort();
+            }
+
             MelonLogger.Msg($"Contract added: Product={product.Name}, Quantity={quantity}, Payment={payment}, TotalContracts={_pendingContracts.Count}");
-            UpdateCache();
             _productsChanged = true;
         }
 
@@ -94,74 +122,166 @@ namespace easy_deals
                 ? _pendingContracts.ToList()
                 : _pendingContracts.Where(c => c.ProductName == productName).ToList();
 
-            _pendingContracts.RemoveAll(c => contractsToProcess.Contains(c));
+            // Process a smaller number of contracts at once
+            const int maxContractsPerBatch = 3; // Reduced from 5
+            const int delayBetweenContracts = 300; // milliseconds between contracts
+            const int delayBetweenBatches = 3000; // milliseconds between batches
+            int processedCount = 0;
 
+            _pendingContracts.RemoveAll(c => contractsToProcess.Contains(c));
+            RemoveContracts(contractsToProcess);
+
+            // Group by customer but limit the number per customer
+            var groupedContracts = contractsToProcess.GroupBy(c => c.CustomerName).ToList();
+            foreach (var group in groupedContracts)
+            {
+                var contracts = group.ToList();
+                // Process in smaller batches
+                for (int i = 0; i < contracts.Count; i += maxContractsPerBatch)
+                {
+                    var batch = contracts.Skip(i).Take(maxContractsPerBatch).ToList();
+                    yield return MelonCoroutines.Start(ProcessContractBatch(dealWindow, batch, delayBetweenContracts));
+                    processedCount += batch.Count;
+                    MelonLogger.Msg($"Processed batch of {batch.Count} contracts, total processed: {processedCount}/{contractsToProcess.Count}");
+
+                    // Wait longer between batches to let the game catch up
+                    yield return new WaitForSeconds(delayBetweenBatches / 1000f);
+                }
+            }
+
+            // Return remaining contracts to the pool
             foreach (var contract in contractsToProcess)
             {
-                bool taskCompleted = false;
-                contract.Execute(dealWindow).ContinueWith(t => taskCompleted = true);
-                while (!taskCompleted)
-                    yield return new WaitForEndOfFrame();
+                ReturnContract(contract);
             }
 
             _isProcessing = false;
-            MelonLogger.Msg($"Processed {contractsToProcess.Count} contracts for {productName}");
-            UpdateCache();
+            MelonLogger.Msg($"Completed processing {processedCount} contracts for {productName}");
             _productsChanged = true;
         }
 
-        private void UpdateCache()
+        private IEnumerator ProcessContractBatch(EDealWindow dealWindow, List<PendingContract> contracts, int delayBetweenContracts)
         {
-            _offeredProducts = new List<string> { "All" };
-            _offeredProducts.AddRange(_pendingContracts.Select(c => c.ProductName).Distinct().OrderBy(name => name));
-
-            _potentialGains.Clear();
-            _totalQuantities.Clear();
-            _potentialGains["All"] = _pendingContracts.Sum(c => c.Payment + OverallPriceModifier);
-            _totalQuantities["All"] = _pendingContracts.Sum(c => c.Quantity);
-
-            foreach (var productName in _offeredProducts.Where(n => n != "All"))
+            foreach (var contract in contracts)
             {
-                var contracts = _pendingContracts.Where(c => c.ProductName == productName);
-                _potentialGains[productName] = contracts.Sum(c => c.Payment + OverallPriceModifier);
-                _totalQuantities[productName] = contracts.Sum(c => c.Quantity);
-            }
+                bool taskCompleted = false;
+                float timeout = Time.time + 10f;
+                MelonLogger.Msg($"Processing contract for {contract.ProductName}");
 
+                contract.Execute(dealWindow).ContinueWith(t => {
+                    taskCompleted = true;
+                    if (t.IsFaulted)
+                        MelonLogger.Error($"Contract execution failed: {t.Exception?.InnerException?.Message}");
+                });
+
+                // Wait for completion or timeout
+                while (!taskCompleted && Time.time < timeout)
+                {
+                    yield return null;
+                }
+
+                // Increase delay between individual contracts
+                yield return new WaitForSeconds(delayBetweenContracts / 1000f);
+            }
+        }
+
+
+        private void RemoveContracts(List<PendingContract> contracts)
+        {
+            foreach (var contract in contracts)
+            {
+                _potentialGains.TryGetValue("All", out float allGains);
+                _potentialGains["All"] = allGains - (contract.Payment + OverallPriceModifier);
+
+                _totalQuantities.TryGetValue("All", out int allQuantities);
+                _totalQuantities["All"] = allQuantities - contract.Quantity;
+
+                _potentialGains.TryGetValue(contract.ProductName, out float productGains);
+                _potentialGains[contract.ProductName] = productGains - (contract.Payment + OverallPriceModifier);
+
+                _totalQuantities.TryGetValue(contract.ProductName, out int productQuantities);
+                _totalQuantities[contract.ProductName] = productQuantities - contract.Quantity;
+
+                if (!_pendingContracts.Any(c => c.ProductName == contract.ProductName))
+                {
+                    _potentialGains.Remove(contract.ProductName);
+                    _totalQuantities.Remove(contract.ProductName);
+                    _offeredProducts.Remove(contract.ProductName);
+                }
+            }
         }
 
         public void UpdateGainsForModifierChange()
         {
-            foreach (var productName in _potentialGains.Keys.ToList())
+            _potentialGains.Clear();
+            _potentialGains["All"] = _pendingContracts.Sum(c => c.Payment + OverallPriceModifier);
+
+            foreach (var productName in _offeredProducts.Where(n => n != "All"))
             {
-                var contracts = productName == "All"
-                    ? _pendingContracts
-                    : _pendingContracts.Where(c => c.ProductName == productName);
-                _potentialGains[productName] = contracts.Sum(c => c.Payment + OverallPriceModifier);
+                _potentialGains[productName] = _pendingContracts
+                    .Where(c => c.ProductName == productName)
+                    .Sum(c => c.Payment + OverallPriceModifier);
             }
         }
 
         public List<string> GetOfferedProductNames() => _offeredProducts;
         public bool HasProductsChanged() => _productsChanged;
         public void ResetProductsChanged() => _productsChanged = false;
-        public float GetPotentialGain(string productName = "All") => _potentialGains.TryGetValue(productName, out float gain) ? gain : 0f;
-        public int GetTotalQuantity(string productName = "All") => _totalQuantities.TryGetValue(productName, out int qty) ? qty : 0;
+
+        public float GetPotentialGain(string productName = "All")
+        {
+            _potentialGains.TryGetValue(productName, out float gain);
+            return gain;
+        }
+
+        public int GetTotalQuantity(string productName = "All")
+        {
+            _totalQuantities.TryGetValue(productName, out int qty);
+            return qty;
+        }
+
         public List<PendingContract> GetPendingContracts() => _pendingContracts;
+
+        private PendingContract GetContract(ProductDefinition product, int quantity, float payment, Customer customer)
+        {
+            PendingContract contract;
+            if (_contractPool.Count > 0)
+            {
+                contract = _contractPool.Dequeue();
+                contract.Reset(product, quantity, payment, customer);
+            }
+            else
+            {
+                contract = new PendingContract(product, quantity, payment, customer);
+            }
+            return contract;
+        }
+
+        private void ReturnContract(PendingContract contract)
+        {
+            _contractPool.Enqueue(contract);
+        }
     }
 
     public class PendingContract
     {
-        private readonly ProductDefinition _product;
-        private readonly int _quantity;
-        private readonly float _payment;
-        private readonly Customer _customer;
+        private ProductDefinition _product;
+        private int _quantity;
+        private float _payment;
+        private Customer _customer;
 
-        public string ProductName => _product.Name;
+        public string ProductName => _product != null ? _product.Name : "Null Product";
         public float Payment => _payment;
         public int Quantity => _quantity;
-        public string CustomerName => _customer.name;
+        public string CustomerName => _customer != null ? _customer.name : "Null Customer";
         public ProductDefinition Product => _product;
 
         public PendingContract(ProductDefinition product, int quantity, float payment, Customer customer)
+        {
+            Reset(product, quantity, payment, customer);
+        }
+
+        public void Reset(ProductDefinition product, int quantity, float payment, Customer customer)
         {
             _product = product;
             _quantity = quantity;
@@ -171,37 +291,109 @@ namespace easy_deals
 
         public async Task Execute(EDealWindow dealWindow)
         {
+            if (_customer == null || _product == null)
+            {
+                MelonLogger.Warning($"Skipping contract execution: Invalid customer or product");
+                return;
+            }
+
             float finalPrice = _payment + ContractManager.Instance.OverallPriceModifier;
-            await Task.Delay(100);
-            await RunOnMainThread(() => _customer.EvaluateCounteroffer(_product, _quantity, finalPrice));
-            await Task.Delay(200);
-            await RunOnMainThread(() => _customer.SendCounteroffer(_product, _quantity, finalPrice));
-            await Task.Delay(2000);
-            await RunOnMainThread(() => _customer.PlayerAcceptedContract(dealWindow));
+
+            // Use a safer execution pattern with timeouts and retries
+            int maxRetries = 2;
+            int currentRetry = 0;
+
+            while (currentRetry <= maxRetries)
+            {
+                try
+                {
+                    MelonLogger.Msg($"Step 1: EvaluateCounteroffer for {ProductName} (attempt {currentRetry + 1})");
+                    bool step1Success = false;
+
+                    // Add timeout for safety
+                    var task1 = RunOnMainThread(() => {
+                        _customer.EvaluateCounteroffer(_product, _quantity, finalPrice);
+                        return true;
+                    });
+
+                    // Wait with timeout
+                    if (await Task.WhenAny(task1, Task.Delay(5000)) == task1)
+                        step1Success = await task1;
+                    else
+                        throw new TimeoutException("EvaluateCounteroffer timed out");
+
+                    await Task.Delay(200);
+
+                    MelonLogger.Msg($"Step 2: SendCounteroffer for {ProductName}");
+                    bool step2Success = false;
+
+                    var task2 = RunOnMainThread(() => {
+                        _customer.SendCounteroffer(_product, _quantity, finalPrice);
+                        return true;
+                    });
+
+                    if (await Task.WhenAny(task2, Task.Delay(5000)) == task2)
+                        step2Success = await task2;
+                    else
+                        throw new TimeoutException("SendCounteroffer timed out");
+
+                    await Task.Delay(1500);
+
+                    MelonLogger.Msg($"Step 3: PlayerAcceptedContract for {ProductName}");
+
+                    var task3 = RunOnMainThread(() => {
+                        _customer.PlayerAcceptedContract(dealWindow);
+                        _customer.NPC.MSGConversation.ClearResponses(true);
+                        return true;
+                    });
+
+                    if (await Task.WhenAny(task3, Task.Delay(5000)) != task3)
+                        throw new TimeoutException("PlayerAcceptedContract timed out");
+
+                    // If we got here, all steps completed successfully
+                    MelonLogger.Msg($"Contract successfully executed for {ProductName}");
+                    return;
+                }
+                catch (Exception ex)
+                {
+                    currentRetry++;
+                    MelonLogger.Error($"Contract execution attempt {currentRetry} failed for {ProductName}: {ex.Message}");
+
+                    if (currentRetry > maxRetries)
+                    {
+                        MelonLogger.Error($"Failed to execute contract after {maxRetries + 1} attempts");
+                        return;
+                    }
+
+                    // Wait before retry
+                    await Task.Delay(1000);
+                }
+            }
         }
 
-        private Task RunOnMainThread(Action action)
+        private Task<T> RunOnMainThread<T>(Func<T> action)
         {
-            var tcs = new TaskCompletionSource<bool>();
+            var tcs = new TaskCompletionSource<T>();
             MelonCoroutines.Start(ExecuteOnMainThread(action, tcs));
             return tcs.Task;
         }
 
-        private IEnumerator ExecuteOnMainThread(Action action, TaskCompletionSource<bool> tcs)
+        private IEnumerator ExecuteOnMainThread<T>(Func<T> action, TaskCompletionSource<T> tcs)
         {
             yield return null;
             try
             {
-                action();
-                tcs.SetResult(true);
+                T result = action();
+                tcs.SetResult(result);
             }
             catch (Exception ex)
             {
-                MelonLogger.Error($"Error executing contract: {ex.Message}");
                 tcs.SetException(ex);
             }
         }
     }
+
+    
 
     public class MainHandler : MelonMod
     {
@@ -225,7 +417,7 @@ namespace easy_deals
                 MelonLogger.Msg("Mod initialized in Main scene");
             }
         }
-
+        
         public EDealWindow GetTimePeriod(int time)
         {
             int timeInCycle = time % 2400;
@@ -269,6 +461,11 @@ namespace easy_deals
         private string GetSliderDisplayText()
         {
             if (_timeManager == null) return "Time not available";
+            if (_offeredProducts == null || _offeredProducts.Count == 0) return "No products available";
+            if (_selectedProductIndex < 0 || _selectedProductIndex >= _offeredProducts.Count) return "Invalid product selection";
+            
+    
+        if (_selectedPeriodIndex < 0 || _selectedPeriodIndex >= _dealPeriods.Length) return "Invalid period selection";
 
             int currentTime = _timeManager.GetDateTime().time;
             int timeInCycle = currentTime % 2400;
@@ -296,8 +493,16 @@ namespace easy_deals
             if (_contractManager.HasProductsChanged())
             {
                 _offeredProducts = _contractManager.GetOfferedProductNames();
-                if (_selectedProductIndex >= _offeredProducts.Count)
+                // Ensure _selectedProductIndex is valid
+                if (_offeredProducts.Count == 0)
+                {
+                    _offeredProducts.Add("All");
                     _selectedProductIndex = 0;
+                }
+                else if (_selectedProductIndex >= _offeredProducts.Count)
+                {
+                    _selectedProductIndex = _offeredProducts.Count - 1;
+                }
                 _contractManager.ResetProductsChanged();
             }
 
@@ -332,8 +537,6 @@ namespace easy_deals
                     if (!_isMenuOpen) { _showSliderText = true; _sliderTextTimer = 2.5f; }
                 }
             }
-            
-            
 
             if (Input.GetKeyDown(KeyBindings.AcceptContractKey))
             {
@@ -356,11 +559,23 @@ namespace easy_deals
                 if (!_isMenuOpen) { _showSliderText = true; _sliderTextTimer = 2.5f; }
             }
 
-            //if (Input.GetKeyDown(KeyCode.Keypad2))
-            //{
-            //    int currentTime = _timeManager.GetDateTime().time;
-            //    _timeManager.SetTime(currentTime + 100);
-            //}
+            if (Input.GetKeyDown(KeyCode.Keypad2))
+            {
+                int currentTime = _timeManager.GetDateTime().time;
+                _timeManager.SetTime(currentTime + 100);
+            }
+
+            if (Input.GetKeyDown(KeyCode.Keypad3))
+            {
+                try
+                {
+                    TestingClass.TestingClass.GenerateRandomQuests(10);
+                }
+                catch (Exception ex)
+                {
+                    MelonLogger.Error(ex);
+                }
+            }
 
             if (_showSliderText && !_isMenuOpen)
             {
@@ -386,6 +601,9 @@ namespace easy_deals
 
     public static class DealsTracker
     {
+        // Cache for product definitions keyed by ProductID
+        private static readonly Dictionary<string, ProductDefinition> _productCache = new Dictionary<string, ProductDefinition>();
+
         public static void AddDealToList(Customer customer)
         {
             var contract = customer.offeredContractInfo;
@@ -399,24 +617,43 @@ namespace easy_deals
             var productId = productEntry.ProductID;
             var customerName = customer.name;
 
-            if (ContractManager.Instance.GetPendingContracts().Any(c => c.CustomerName == customerName && c.Product.ID == productId))
+            // Check if a contract already exists
+            if (ContractManager.Instance.GetPendingContracts()
+                .Any(c => c.CustomerName == customerName && c.Product.ID == productId))
             {
                 MelonLogger.Msg($"Contract already exists for {customerName}, ProductID={productId}");
                 return;
             }
 
-            foreach (var product in customer.OrderableProducts)
+            // Try to get from cache
+            if (!_productCache.TryGetValue(productId, out var productDef))
             {
-                if (product.ID == productEntry.ProductID)
+                // Cache miss: manually search in customer's orderable products
+                foreach (var p in customer.OrderableProducts)
                 {
-                    MelonLogger.Msg($"Adding contract: Product={product.Name}, Quantity={productEntry.Quantity}, Payment={contract.Payment}, Customer={customerName}");
-                    ContractManager.Instance.AddContract(product, productEntry.Quantity, contract.Payment, customer);
+                    if (p.ID == productId)
+                    {
+                        productDef = p;
+                        _productCache[productId] = productDef; // Cache it for future use
+                        
+                        break;
+                    }
+                }
+
+                if (productDef == null)
+                {
+                    MelonLogger.Warning($"No matching product found for ProductID={productId} in {customerName}'s OrderableProducts");
                     return;
                 }
             }
-            MelonLogger.Warning($"No matching product found for ProductID={productId} in {customerName}'s OrderableProducts");
+
+
+            // Add contract using cached or found definition
+            MelonLogger.Msg($"Adding contract: Product={productDef.Name}, Quantity={productEntry.Quantity}, Payment={contract.Payment}, Customer={customerName}");
+            ContractManager.Instance.AddContract(productDef, productEntry.Quantity, contract.Payment, customer);
         }
     }
+
 
     [HarmonyPatch(typeof(Customer), "OfferContract")]
     public static class CustomerPatch
@@ -435,6 +672,27 @@ namespace easy_deals
         {
             MelonLogger.Msg("Customer.RpcReader_SetOfferedContract patch triggered");
             DealsTracker.AddDealToList(__instance);
+        }
+    }
+
+    [HarmonyPatch(typeof(Customer), "Load")]
+    public static class CustomerStartPatch
+    {
+        private static void Postfix(Customer __instance)
+        {
+            try
+            {
+                // Check if this customer has an active contract offer
+                if (__instance != null && __instance.offeredContractInfo != null)
+                {
+                    MelonLogger.Msg($"CustomerStartPatch: Found active contract for {__instance.name}");
+                    DealsTracker.AddDealToList(__instance);
+                }
+            }
+            catch (Exception ex)
+            {
+                MelonLogger.Error($"Error in CustomerStartPatch for {(__instance != null ? __instance.name : "unknown")}: {ex.Message}");
+            }
         }
     }
 }

@@ -97,6 +97,7 @@
   <ItemGroup>
     <Compile Include="EasyDeals.cs" />
     <Compile Include="Properties\AssemblyInfo.cs" />
+    <Compile Include="TestingClass.cs" />
   </ItemGroup>
   <Import Project="$(MSBuildToolsPath)\Microsoft.CSharp.targets" />
 </Project>
